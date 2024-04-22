@@ -42,6 +42,29 @@ def entropy(p, eps=1e-8):
     return ent.sum(dim=-1).mean()
 
 
+def group_sae_loss(activations, ae, sparsity_penalty, separate=False):
+    # see https://manosth.github.io/files/papers/TheodosisTolooshamsTankala+_GroupSparseAE_ICML21.pdf
+    
+    if isinstance(activations, tuple): # for cases when the input to the autoencoder is not the same as the output
+        in_acts, out_acts = activations
+    else: # typically the input to the autoencoder is the same as the output
+        in_acts = out_acts = activations
+
+    # reconstruction loss
+    x_hat, f = ae(in_acts, output_features=True)
+    mse_loss = t.linalg.norm(out_acts - x_hat, dim=-1).mean()
+    
+    # group sparsity regularization
+    group_sparsity_reg = 0
+    for g in range(ae.encoder.shape[0]):
+        group_sparsity_reg += t.norm(ae.encoder[g, :], p=2)
+        
+    if separate:
+        return mse_loss, group_sparsity_reg
+    else:
+        return mse_loss + sparsity_penalty * group_sparsity_reg
+    
+
 def sae_loss(activations, ae, sparsity_penalty, use_entropy=False, separate=False, num_samples_since_activated=None, ghost_threshold=None):
     """
     Compute the loss of an autoencoder on some activations
