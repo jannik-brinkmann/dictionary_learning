@@ -7,7 +7,12 @@ from nnsight.models.LanguageModel import LanguageModelProxy
 from dictionary_learning.dictionary import Dictionary
 
 
-# TODO: make the code cleaner and easier to read
+from nnsight import DEFAULT_PATCHER
+from nnsight.tracing.Proxy import proxy_wrapper
+from nnsight.patching import Patch
+
+
+DEFAULT_PATCHER.add(Patch(torch, proxy_wrapper(torch.zeros), "zeros"))
 
 
 def FISTA(I,basis,lambd,num_iter,eta=None, useMAGMA=True):
@@ -17,14 +22,15 @@ def FISTA(I,basis,lambd,num_iter,eta=None, useMAGMA=True):
     batch_size=I.size(1)
     M = basis.size(1)
     if eta is None:
-        L = torch.max(torch.linalg.eigh(torch.mm(basis,basis.t()))[0])
+        L = torch.max(torch.linalg.eigh(torch.mm(basis, basis.t()))[0])
         eta = 1./L
 
     tk_n = 1.
     tk = 1.
-    Res = torch.cuda.FloatTensor(I.size()).fill_(0)
-    ahat = torch.cuda.FloatTensor(M,batch_size).fill_(0)
-    ahat_y = torch.cuda.FloatTensor(M,batch_size).fill_(0)
+    Res = torch.zeros_like(I).cuda()
+    # Res = torch.cuda.FloatTensor(.size()).fill_(0)
+    ahat = torch.zeros((M,batch_size)).cuda()
+    ahat_y = torch.zeros((M,batch_size)).cuda()
 
     for t in range(num_iter):
         tk = tk_n
