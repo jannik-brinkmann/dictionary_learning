@@ -3,6 +3,7 @@ Implements the SAE training scheme from https://arxiv.org/abs/2406.04093.
 Significant portions of this code have been copied from https://github.com/EleutherAI/sae/blob/main/sae
 """
 
+import copy
 import einops
 import torch as t
 import torch.nn as nn
@@ -199,14 +200,18 @@ class TrainerTopK(SAETrainer):
         self.effective_l0 = -1
         self.dead_features = -1
 
-    def loss(self, x, step=None, logging=False):
+    def loss(self, x, y=None, step=None, logging=False):
+        
+        if y is None:
+            y = copy.deepcopy(x)
+        
         # Run the SAE
         f, top_acts, top_indices = self.ae.encode(x, return_topk=True)
         x_hat = self.ae.decode(f)
 
         # Measure goodness of reconstruction
-        e = x_hat - x
-        total_variance = (x - x.mean(0)).pow(2).sum(0)
+        e = x_hat - y
+        total_variance = (y - y.mean(0)).pow(2).sum(0)
 
         # Update the effective L0 (again, should just be K)
         self.effective_l0 = top_acts.size(1)
@@ -260,24 +265,35 @@ class TrainerTopK(SAETrainer):
             return loss
         else:
             return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
-                x,
+                y,
                 x_hat,
                 f,
                 {"l2_loss": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item()},
             )
 
-    def update(self, step, x):
+    def update(self, step, x):        
+        
         # Initialise the decoder bias
         if step == 0:
-            median = geometric_median(x)
+            if isinstance(x, tuple):
+                act_in, act_out = x
+                median = geometric_median(act_in)
+            else:
+                median = geometric_median(x)
             self.ae.b_dec.data = median
 
         # Make sure the decoder is still unit-norm
         self.ae.set_decoder_norm_to_unit_norm()
 
         # compute the loss
-        x = x.to(self.device)
-        loss = self.loss(x, step=step)
+        if isinstance(x, tuple):
+            act_in, act_out = x
+            act_in = act_in.to(self.device)
+            act_out = act_out.to(self.device)
+            loss = self.loss(act_in, act_out, step=step)
+        else:
+            x = x.to(self.device)
+            loss = self.loss(x, step=step)
         loss.backward()
 
         # clip grad norm and remove grads parallel to decoder directions

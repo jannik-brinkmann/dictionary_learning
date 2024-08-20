@@ -4,6 +4,7 @@ Training dictionaries
 
 import torch as t
 from .dictionary import AutoEncoder
+from .buffer import SkipActivationBuffer
 import os
 from tqdm import tqdm
 from .trainers.standard import StandardTrainer
@@ -19,28 +20,34 @@ def log_stats(
     activations_split_by_head: bool,
     transcoder: bool,
 ):
+    
     log = {}
     with t.no_grad():
         # quick hack to make sure all trainers get the same x
         # TODO make this less hacky
-        z = act.clone()
+        act_in, act_out = act
+        z1 = act_in.clone()
+        z2 = act_out.clone()
         for i, trainer in enumerate(trainers):
-            act = z.clone()
+            act_in = z1.clone()
+            act_out = z2.clone()
+            
             if activations_split_by_head:  # x.shape: [batch, pos, n_heads, d_head]
+                raise Exception
                 act = act[..., i, :]
             trainer_name = f'{trainer.config["wandb_name"]}-{i}'
             if not transcoder:
-                act, act_hat, f, losslog = trainer.loss(act, step=step, logging=True)  # act is x
+                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, step=step, logging=True)  # act is x
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
                 # fraction of variance explained
-                total_variance = t.var(act, dim=0).sum()
-                residual_variance = t.var(act - act_hat, dim=0).sum()
+                total_variance = t.var(act_out, dim=0).sum()
+                residual_variance = t.var(act_out - act_hat, dim=0).sum()
                 frac_variance_explained = 1 - residual_variance / total_variance
                 log[f"{trainer_name}/frac_variance_explained"] = frac_variance_explained.item()
             else:  # transcoder
-                x, x_hat, f, losslog = trainer.loss(act, step=step, logging=True)  # act is x, y
+                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, step=step, logging=True)  # act is x, y
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
@@ -59,37 +66,18 @@ def log_stats(
             for name, value in trainer_log.items():
                 log[f"{trainer_name}/{name}"] = value
 
-            # TODO get this to work
-            # metrics = evaluate(
-            #     trainer.ae,
-            #     data,
-            #     device=trainer.device
-            # )
-            # log.update(
-            #     {f'trainer{i}/{k}' : v for k, v in metrics.items()}
-            # )
     if use_wandb:
         wandb.log(log, step=step)
 
+
 def trainSAE(
         data, 
-        trainer_configs = [
-            {
-                'trainer' : StandardTrainer,
-                'dict_class' : AutoEncoder,
-                'activation_dim' : 512,
-                'dict_size' : 64*512,
-                'lr' : 1e-3,
-                'l1_penalty' : 1e-1,
-                'warmup_steps' : 1000,
-                'resample_steps' : None,
-                'seed' : None,
-                'wandb_name' : 'StandardTrainer',
-            }
-        ],
+        trainer_configs,
         use_wandb = False,
         wandb_entity = "",
         wandb_project = "",
+        wandb_group = "",
+        wandb_name = "",
         steps=None,
         save_steps=None,
         save_dir=None, # use {run} to refer to wandb run
@@ -111,12 +99,13 @@ def trainSAE(
             )
         )
 
-
     if log_steps is not None:
         if use_wandb:
             wandb.init(
                 entity=wandb_entity,
                 project=wandb_project,
+                group=wandb_group,
+                name=wandb_name,
                 config={f'{trainer.config["wandb_name"]}-{i}' : trainer.config for i, trainer in enumerate(trainers)}
             )
             # process save_dir in light of run name
@@ -132,7 +121,8 @@ def trainSAE(
             config = {'trainer' : trainer.config}
             try:
                 config['buffer'] = data.config
-            except: pass
+            except: 
+                pass
             with open(os.path.join(dir, "config.json"), 'w') as f:
                 json.dump(config, f, indent=4)
     else:
@@ -141,7 +131,10 @@ def trainSAE(
     for step, act in enumerate(tqdm(data, total=steps)):
         if steps is not None and step >= steps:
             break
-
+        
+        if not isinstance(data, SkipActivationBuffer):
+            act = (act, act)
+        
         # logging
         if log_steps is not None and step % log_steps == 0:
             log_stats(trainers, step, act, use_wandb, activations_split_by_head, transcoder)
