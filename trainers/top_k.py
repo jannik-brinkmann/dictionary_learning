@@ -7,6 +7,7 @@ import copy
 import einops
 import torch as t
 import torch.nn as nn
+import torch.nn.functional as F
 from collections import namedtuple
 
 from ..config import DEBUG
@@ -179,7 +180,7 @@ class TrainerTopK(SAETrainer):
         self.lr = 2e-4 / scale**0.5
         self.auxk_alpha = auxk_alpha
         self.dead_feature_threshold = 10_000_000
-
+        
         # Optimizer and scheduler
         self.optimizer = t.optim.Adam(self.ae.parameters(), lr=self.lr, betas=(0.9, 0.999))
 
@@ -200,7 +201,7 @@ class TrainerTopK(SAETrainer):
         self.effective_l0 = -1
         self.dead_features = -1
 
-    def loss(self, x, y=None, step=None, logging=False):
+    def loss(self, x, y=None, step=None, model=None, logging=False):
         
         if y is None:
             y = copy.deepcopy(x)
@@ -208,7 +209,7 @@ class TrainerTopK(SAETrainer):
         # Run the SAE
         f, top_acts, top_indices = self.ae.encode(x, return_topk=True)
         x_hat = self.ae.decode(f)
-
+        
         # Measure goodness of reconstruction
         e = x_hat - y
         total_variance = (y - y.mean(0)).pow(2).sum(0)
@@ -260,6 +261,42 @@ class TrainerTopK(SAETrainer):
         l2_loss = e.pow(2).sum(dim=-1).mean()
         auxk_loss = auxk_loss.sum(dim=-1).mean()
         loss = l2_loss + self.auxk_alpha * auxk_loss
+        
+        # KL divergence
+        use_kl = True
+        residual_kl = True
+        if use_kl:
+            
+            # Input is residual mid
+            if residual_kl:
+                layer = 11
+                
+                # Original probabilities
+                original_mlp_out = model._module.blocks[layer].apply_mlp(x)
+                original_block_output = x + original_mlp_out
+                original_logits = model._module.unembed(model._module.ln_final(original_block_output))
+                original_probs = F.log_softmax(original_logits, dim=-1)
+                
+                # Reconstructed probabilities
+                reconstructed_mlp_out = model._module.blocks[layer].apply_mlp(x_hat)
+                reconstructed_block_output = x + reconstructed_mlp_out
+                reconstructed_logits = model._module.unembed(model._module.ln_final(reconstructed_block_output))
+                reconstructed_probs = F.log_softmax(reconstructed_logits, dim=-1)
+                
+                # Compute KL divergence
+                kl_div = F.kl_div(reconstructed_probs, original_probs, log_target=True, reduction='batchmean')
+                
+                # Compute MLP reconstruction
+                mlp_diff = reconstructed_mlp_out - original_mlp_out
+                mlp_reconstruction = mlp_diff.pow(2).sum(dim=-1).mean()
+                
+                print("kl", kl_div)
+                print("mlp", mlp_reconstruction)
+                
+                # Update loss
+                kl_alpha = 1
+                mlp_alpha = 0.00001
+                loss += kl_alpha * kl_div + mlp_alpha * mlp_reconstruction
 
         if not logging:
             return loss
@@ -271,7 +308,7 @@ class TrainerTopK(SAETrainer):
                 {"l2_loss": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item()},
             )
 
-    def update(self, step, x):        
+    def update(self, step, x, model):        
         
         # Initialise the decoder bias
         if step == 0:
@@ -290,10 +327,10 @@ class TrainerTopK(SAETrainer):
             act_in, act_out = x
             act_in = act_in.to(self.device)
             act_out = act_out.to(self.device)
-            loss = self.loss(act_in, act_out, step=step)
+            loss = self.loss(act_in, act_out, step=step, model=model)
         else:
             x = x.to(self.device)
-            loss = self.loss(x, step=step)
+            loss = self.loss(x, step=step, model=model)
         loss.backward()
 
         # clip grad norm and remove grads parallel to decoder directions

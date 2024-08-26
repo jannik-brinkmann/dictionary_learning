@@ -13,6 +13,7 @@ import json
 # from .evaluation import evaluate
 
 def log_stats(
+    model,
     trainers,
     step: int,
     act: t.Tensor,
@@ -37,7 +38,7 @@ def log_stats(
                 act = act[..., i, :]
             trainer_name = f'{trainer.config["wandb_name"]}-{i}'
             if not transcoder:
-                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, step=step, logging=True)  # act is x
+                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, step=step, model=model, logging=True)  # act is x
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
@@ -71,6 +72,7 @@ def log_stats(
 
 
 def trainSAE(
+        model,
         data, 
         trainer_configs,
         use_wandb = False,
@@ -137,7 +139,7 @@ def trainSAE(
         
         # logging
         if log_steps is not None and step % log_steps == 0:
-            log_stats(trainers, step, act, use_wandb, activations_split_by_head, transcoder)
+            log_stats(model, trainers, step, act, use_wandb, activations_split_by_head, transcoder)
             
         # saving
         if save_steps is not None and step % save_steps == 0:
@@ -152,7 +154,7 @@ def trainSAE(
                     
         # training
         for trainer in trainers:
-            trainer.update(step, act)
+            trainer.update(step, act, model)
     
     # save final SAEs
     for save_dir, trainer in zip(save_dirs, trainers):

@@ -247,20 +247,31 @@ class SkipActivationBuffer(ActivationBuffer):
                         hidden_states_out = self.submodule_out.input[0].save()
                     else:
                         hidden_states_in = self.submodule_in.output.save()
-                        hidden_states_out = self.submodule_out.input[0].save()
+                        hidden_states_out = self.submodule_out.output.save()
                     input = self.model.input.save()
-                    
-            attn_mask = input.value[1]["attention_mask"]
             
+            if "attention_mask" in input.value[1]:
+                attn_mask = input.value[1]["attention_mask"] 
+            # else:
+            #     attn_mask = t.eq(input[1]["input"], 50256).int()
+
             hidden_states_in = hidden_states_in.value
             if isinstance(hidden_states_in, tuple):
                 hidden_states_in = hidden_states_in[0]
-            hidden_states_in = hidden_states_in[attn_mask != 0]
+            if "attention_mask" in input.value[1]:
+                hidden_states_in = hidden_states_in[attn_mask != 0]
+            else:
+                a, b, c = hidden_states_in.shape
+                hidden_states_in = hidden_states_in.view(a * b, c)
             
             hidden_states_out = hidden_states_out.value
             if isinstance(hidden_states_out, tuple):
                 hidden_states_out = hidden_states_out[0]
-            hidden_states_out = hidden_states_out[attn_mask != 0]
+            if "attention_mask" in input.value[1]:
+                hidden_states_out = hidden_states_out[attn_mask != 0]
+            else:
+                a, b, c = hidden_states_out.shape
+                hidden_states_out = hidden_states_in.view(a * b, c)
 
             remaining_space = self.activation_buffer_size - current_idx
             assert remaining_space > 0
