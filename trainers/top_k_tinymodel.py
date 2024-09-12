@@ -426,20 +426,22 @@ class TrainerTopK(SAETrainer):
                 b = 128
                 _, d = x.shape
 
+                z_reshaped = z.view(a, b, d)
+
                 x_reshaped = x.view(a, b, d)
-                res_mlp = z + x_reshaped
+                res_mlp = z_reshaped + x_reshaped
                 mlp_out = model._module.torso[0].mlp(res_mlp)
                 res_final = res_mlp + mlp_out
 
                 x_hat_reshaped = x_hat.view(a, b, d)
-                res_mlp_hat = z + x_hat_reshaped
+                res_mlp_hat = z_reshaped + x_hat_reshaped
                 mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
                 res_final_hat = res_mlp_hat + mlp_out_hat
 
                 # (4)
                 f, _, _ = self.saes["torso[0].res_final"].encode(res_final.view(a * b, d), return_topk=True)
                 f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
 
                 # (5)
                 f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
@@ -448,30 +450,38 @@ class TrainerTopK(SAETrainer):
 
             case "embed":
                 """(7) Train it to sparsely reconstruct activations of (4), (5) and (6)."""
-                
-                attn_out = model._module.torso[0].attn(x)
-                res_mlp = x + attn_out
+
+                # requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+
+                a = 64
+                b = 128
+                _, d = x.shape
+
+                x_reshaped = x.view(a, b, d)
+                attn_out = model._module.torso[0].attn(x_reshaped)
+                res_mlp = x_reshaped + attn_out
                 mlp_out = model._module.torso[0].mlp(res_mlp)
                 res_final = res_mlp + mlp_out
                 
-                attn_out_hat = model._module.torso[0].attn(x_hat)
-                res_mlp_hat = x_hat + attn_out_hat
+                x_hat_reshaped = x_hat.view(a, b, d)
+                attn_out_hat = model._module.torso[0].attn(x_hat_reshaped)
+                res_mlp_hat = x_hat_reshaped + attn_out_hat
                 mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
                 res_final_hat = res_mlp_hat + mlp_out_hat
 
                 # (4)
-                f, _, _ = self.saes["torso[0].res_final"].encode(res_final, return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat, return_topk=True)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
                 rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
 
                 # (5)
-                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp, return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat, return_topk=True)
+                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
                 rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
 
                 # (6)
-                f, _, _ = self.saes["torso[0].attn"].encode(attn_out, return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].attn"].encode(attn_out_hat, return_topk=True)
+                f, _, _ = self.saes["torso[0].attn"].encode(attn_out.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
                 rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
 
             case _:
