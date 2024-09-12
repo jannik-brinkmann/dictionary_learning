@@ -420,22 +420,30 @@ class TrainerTopK(SAETrainer):
             case "torso[0].attn": # z is residual before attn
                 """(6) Train it to sparsely reconstruct activations of (4) and (5)."""
 
-                res_mlp = z + x
+                # Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+
+                a = 64
+                b = 128
+                _, d = x.shape
+
+                x_reshaped = x.view(a, b, d)
+                res_mlp = z + x_reshaped
                 mlp_out = model._module.torso[0].mlp(res_mlp)
                 res_final = res_mlp + mlp_out
 
-                res_mlp_hat = z + x_hat
+                x_hat_reshaped = x_hat.view(a, b, d)
+                res_mlp_hat = z + x_hat_reshaped
                 mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
                 res_final_hat = res_mlp_hat + mlp_out_hat
 
                 # (4)
-                f, _, _ = self.saes["torso[0].res_final"].encode(res_final, return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat, return_topk=True)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
                 rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
 
                 # (5)
-                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp, return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat, return_topk=True)
+                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
                 rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
 
             case "embed":
