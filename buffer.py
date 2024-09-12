@@ -80,9 +80,12 @@ class ActivationBuffer:
         if batch_size is None:
             batch_size = self.refresh_batch_size
         try:
-            return [
+            # Temporary fix for TinyModel
+            text = [
                 next(self.data) for _ in range(batch_size)
             ]
+            return t.tensor(text, dtype=t.long)
+        
         except StopIteration:
             raise StopIteration("End of data stream reached")
     
@@ -250,15 +253,16 @@ class SkipActivationBuffer(ActivationBuffer):
                         hidden_states_out = self.submodule_out.output.save()
                     input = self.model.input.save()
             
-            if "attention_mask" in input.value[1]:
-                attn_mask = input.value[1]["attention_mask"] 
+            attn_mask = None
+            # if "attention_mask" in input.value[1]:
+            #     attn_mask = input.value[1]["attention_mask"] 
             # else:
             #     attn_mask = t.eq(input[1]["input"], 50256).int()
 
             hidden_states_in = hidden_states_in.value
             if isinstance(hidden_states_in, tuple):
                 hidden_states_in = hidden_states_in[0]
-            if "attention_mask" in input.value[1]:
+            if attn_mask:
                 hidden_states_in = hidden_states_in[attn_mask != 0]
             else:
                 a, b, c = hidden_states_in.shape
@@ -267,7 +271,7 @@ class SkipActivationBuffer(ActivationBuffer):
             hidden_states_out = hidden_states_out.value
             if isinstance(hidden_states_out, tuple):
                 hidden_states_out = hidden_states_out[0]
-            if "attention_mask" in input.value[1]:
+            if attn_mask:
                 hidden_states_out = hidden_states_out[attn_mask != 0]
             else:
                 a, b, c = hidden_states_out.shape
@@ -291,6 +295,161 @@ class SkipActivationBuffer(ActivationBuffer):
 
         # pbar.close()
         self.read = t.zeros(len(self.activations_in), dtype=t.bool, device=self.device)
+
+
+class SkipActivationBufferWithAddition(ActivationBuffer):
+    
+    def __init__(
+        self, 
+        data, 
+        model: LanguageModel, 
+        submodule_in, 
+        submodule_out,
+        submodule_add,
+        d_submodule=None, 
+        io='out', 
+        n_ctxs = 30000, 
+        ctx_len=128, 
+        refresh_batch_size=512, 
+        out_batch_size=8192, 
+        device='cpu'
+    ):
+        super().__init__(
+            data, 
+            model, 
+            submodule_out, 
+            d_submodule, 
+            io, 
+            n_ctxs, 
+            ctx_len, 
+            refresh_batch_size, 
+            out_batch_size, 
+            device
+        )
+        
+        self.submodule_in = submodule_in
+        self.submodule_out = submodule_out
+        self.submodule_add = submodule_add
+        
+        self.activations_in = t.empty(0, d_submodule, device=device)
+        self.activations_out = t.empty(0, d_submodule, device=device)
+        self.activations_add = t.empty(0, d_submodule, device=device)
+        
+    def __next__(self):
+        """
+        Return a batch of activations
+        """
+        with t.no_grad():
+            # if buffer is less than half full, refresh
+            if (~self.read).sum() < self.n_ctxs * self.ctx_len // 2:
+                self.refresh()
+
+            # return a batch
+            unreads = (~self.read).nonzero().squeeze()
+            idxs = unreads[t.randperm(len(unreads), device=unreads.device)[:self.out_batch_size]]
+            self.read[idxs] = True
+            return self.activations_in[idxs], self.activations_out[idxs], self.activations_add[idxs]
+    
+    def refresh(self):
+        gc.collect()
+        t.cuda.empty_cache()
+        self.activations_in = self.activations_in[~self.read]
+        self.activations_out = self.activations_out[~self.read]
+        self.activations_add = self.activations_add[~self.read]
+        
+        assert len(self.activations_in) == len(self.activations_out)
+        assert len(self.activations_out) == len(self.activations_add)
+
+        current_idx = len(self.activations_in)
+        new_activations_in = t.empty(self.activation_buffer_size, self.d_submodule, device=self.device)
+        new_activations_in[: len(self.activations_in)] = self.activations_in
+        self.activations_in = new_activations_in
+        
+        new_activations_out = t.empty(self.activation_buffer_size, self.d_submodule, device=self.device)
+        new_activations_out[: len(self.activations_out)] = self.activations_out
+        self.activations_out = new_activations_out
+
+        new_activations_add = t.empty(self.activation_buffer_size, self.d_submodule, device=self.device)
+        new_activations_add[: len(self.activations_add)] = self.activations_add
+        self.activations_add = new_activations_add
+
+        # Optional progress bar when filling buffer. At larger models / buffer sizes (e.g. gemma-2-2b, 1M tokens on a 4090) this can take a couple minutes.
+        # pbar = tqdm(total=self.activation_buffer_size, initial=current_idx, desc="Refreshing activations")
+
+        while current_idx < self.activation_buffer_size:
+            with t.no_grad():
+                with self.model.trace(
+                    self.text_batch(),
+                    **tracer_kwargs,
+                    invoker_args={"truncation": True, "max_length": self.ctx_len},
+                ):
+                    
+                    if self.io == "in":
+                        hidden_states_in = self.submodule_in.input[0].save()
+                        hidden_states_out = self.submodule_out.input[0].save()
+                        hidden_states_add = self.submodule_add.input[0].save()
+                    else:
+                        hidden_states_in = self.submodule_in.output.save()
+                        hidden_states_out = self.submodule_out.output.save()
+                        hidden_states_add = self.submodule_add.output.save()
+                    input = self.model.input.save()
+            
+            attn_mask = None
+            # if "attention_mask" in input.value[1]:
+            #     attn_mask = input.value[1]["attention_mask"] 
+            # else:
+            #     attn_mask = t.eq(input[1]["input"], 50256).int()
+
+            hidden_states_in = hidden_states_in.value
+            if isinstance(hidden_states_in, tuple):
+                hidden_states_in = hidden_states_in[0]
+            if attn_mask:
+                hidden_states_in = hidden_states_in[attn_mask != 0]
+            else:
+                a, b, c = hidden_states_in.shape
+                hidden_states_in = hidden_states_in.view(a * b, c)
+            
+            hidden_states_out = hidden_states_out.value
+            if isinstance(hidden_states_out, tuple):
+                hidden_states_out = hidden_states_out[0]
+            if attn_mask:
+                hidden_states_out = hidden_states_out[attn_mask != 0]
+            else:
+                a, b, c = hidden_states_out.shape
+                hidden_states_out = hidden_states_out.view(a * b, c)
+
+            hidden_states_add = hidden_states_add.value
+            if isinstance(hidden_states_add, tuple):
+                hidden_states_add = hidden_states_add[0]
+            if attn_mask:
+                hidden_states_add = hidden_states_add[attn_mask != 0]
+            else:
+                a, b, c = hidden_states_add.shape
+                hidden_states_add = hidden_states_add.view(a * b, c)
+
+            remaining_space = self.activation_buffer_size - current_idx
+            assert remaining_space > 0
+            
+            hidden_states_in = hidden_states_in[:remaining_space]
+            hidden_states_out = hidden_states_out[:remaining_space]
+            hidden_states_add = hidden_states_add[:remaining_space]
+
+            self.activations_in[current_idx : current_idx + len(hidden_states_in)] = hidden_states_in.to(
+                self.device
+            )
+            self.activations_out[current_idx : current_idx + len(hidden_states_out)] = hidden_states_out.to(
+                self.device
+            )
+            self.activations_add[current_idx : current_idx + len(hidden_states_add)] = hidden_states_add.to(
+                self.device
+            )
+            current_idx += len(hidden_states_in)
+
+            # pbar.update(len(hidden_states))
+
+        # pbar.close()
+        self.read = t.zeros(len(self.activations_in), dtype=t.bool, device=self.device)
+
 
 class HeadActivationBuffer:
     """

@@ -3,6 +3,7 @@ Implements the SAE training scheme from https://arxiv.org/abs/2406.04093.
 Significant portions of this code have been copied from https://github.com/EleutherAI/sae/blob/main/sae
 """
 
+import os 
 import copy
 import einops
 import torch as t
@@ -10,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import namedtuple
 
+from ..buffer import SkipActivationBufferWithAddition
 from ..config import DEBUG
 from ..dictionary import Dictionary
 from ..trainers.trainer import SAETrainer
@@ -149,17 +151,91 @@ class TrainerTopK(SAETrainer):
         seed=None,
         device=None,
         layer=None,
+        model=None,
         lm_name=None,
         wandb_name="AutoEncoderTopK",
         submodule_name=None,
+        position_config=None
     ):
         super().__init__(seed)
 
         assert layer is not None and lm_name is not None
         self.layer = layer
+        self.model = model
         self.layer_idx = int(layer)
         self.lm_name = lm_name
         self.submodule_name = submodule_name
+        self.position_config = position_config
+
+        # Load relevant SAEs
+        self.saes = {}
+        def get_sae_path(position_config): 
+            position_config_path = position_config.replace("[", ".").replace("]", "")
+            save_dir = os.path.join("outputs", position_config_path)
+            save_path = os.path.join(save_dir, "trainer_0/ae.pt")
+            return save_path
+        match self.position_config:
+            
+            case "torso[1].res_final":
+                pass
+
+            case "torso[1].res_mlp":
+                ae_path = get_sae_path("torso[1].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_final"] = ae
+
+            case "torso[1].attn":
+                ae_path = get_sae_path("torso[1].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_final"] = ae
+
+                ae_path = get_sae_path("torso[1].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_mlp"] = ae
+
+            case "torso[0].res_final":
+
+                ae_path = get_sae_path("torso[1].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_final"] = ae
+
+                ae_path = get_sae_path("torso[1].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_mlp"] = ae
+
+                ae_path = get_sae_path("torso[1].attn")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].attn"] = ae
+
+            case "torso[0].res_mlp": 
+
+                ae_path = get_sae_path("torso[0].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[0].res_final"] = ae
+
+            case "torso[0].attn": 
+
+                ae_path = get_sae_path("torso[0].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[0].res_final"] = ae
+
+                ae_path = get_sae_path("torso[0].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[0].res_mlp"] = ae
+
+            case "embed":
+
+                ae_path = get_sae_path("torso[0].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[0].res_final"] = ae
+
+                ae_path = get_sae_path("torso[0].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[0].res_mlp"] = ae
+
+                ae_path = get_sae_path("torso[0].attn")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[0].attn"] = ae
 
         self.wandb_name = wandb_name
         self.steps = steps
@@ -202,7 +278,7 @@ class TrainerTopK(SAETrainer):
         self.effective_l0 = -1
         self.dead_features = -1
 
-    def loss(self, x, y=None, step=None, model=None, logging=False):
+    def loss(self, x, y=None, z=None, step=None, model=None, logging=False):
         
         if y is None:
             y = copy.deepcopy(x)
@@ -259,145 +335,145 @@ class TrainerTopK(SAETrainer):
         else:
             auxk_loss = x_hat.new_tensor(0.0)
 
-        l2_loss = e.pow(2).sum(dim=-1).mean()
-        auxk_loss = auxk_loss.sum(dim=-1).mean()
-        loss = l2_loss + self.auxk_alpha * auxk_loss
-        
-        # KL divergence
-        use_kl = False
-        residual_kl = False
-        transcoder_kl = False
-        use_next_layer = False
-        if use_kl:
+        # Compute loss based on specific layer
+        match self.position_config:
+            
+            case "torso[1].res_final": 
+                """(1) For the final SAE, just compute local reconstruction."""
+                rec_loss = e.pow(2).sum(dim=-1).mean()
 
-            # Input and output is residual_post, Local + Next layer reconstruction
-            if use_next_layer:
-                if self.layer_idx < 11: 
+            case "torso[1].res_mlp":  # z is residual before mlp
+                """(2) Train it to sparsely reconstruct activations of (1)."""
+                f, _, _ = self.saes["torso[1].res_final"].encode(x + y, return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_final"].encode(x + x_hat, return_topk=True)
+                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+            case "torso[1].attn":  # z is the residual stream before the attn
+                """(3) Train it to sparsely reconstruct activations of (1) and (2)."""
+
+                # Here we don't need to reshape as MLPs perform local operations
+
+                resid_mid = z + x
+                resid_post = resid_mid + model._module.torso[1].mlp(resid_mid)
+
+                resid_mid_hat = z + x_hat
+                resid_post_hat = resid_mid_hat + model._module.torso[1].mlp(resid_mid_hat)
+
+                # (1)
+                f, _, _ = self.saes["torso[1].res_final"].encode(resid_post, return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_final"].encode(resid_post_hat, return_topk=True)
+                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # (2)
+                f, _, _ = self.saes["torso[1].res_mlp"].encode(resid_mid, return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(resid_mid_hat, return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+            case "torso[0].res_final": 
+                """(4) Train it to sparsely reconstruct activations of (1), (2), and (3)."""
+
+                # Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+
+                a = 64
+                b = 128
+                _, d = x.shape
+
+                x_reshaped = x.view(a, b, d)
+                attn_out = model._module.torso[1].attn(x_reshaped)
+                res_mlp = x_reshaped + attn_out
+                mlp_out = model._module.torso[1].mlp(res_mlp)
+                res_final = res_mlp + mlp_out
+
+                x_hat_reshaped = x_hat.view(a, b, d)
+                attn_out_hat = model._module.torso[1].attn(x_hat_reshaped)
+                res_mlp_hat = x_hat_reshaped + attn_out_hat
+                mlp_out_hat = model._module.torso[1].mlp(res_mlp_hat)
+                res_final_hat = res_mlp_hat + mlp_out_hat
+
+                # (1)
+                f, _, _ = self.saes["torso[1].res_final"].encode(res_final.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
+                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # (2)
+                f, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # (3)
+                f, _, _ = self.saes["torso[1].attn"].encode(attn_out.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+            case "torso[0].res_mlp": 
+                """(5) Train it to sparsely reconstruct activations of (4)."""
+
+                res_final = x + y
+
+                res_final_hat = x + x_hat
+
+                # (4)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat, return_topk=True)
+                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+            case "torso[0].attn": # z is residual before attn
+                """(6) Train it to sparsely reconstruct activations of (4) and (5)."""
+
+                res_mlp = z + x
+                mlp_out = model._module.torso[0].mlp(res_mlp)
+                res_final = res_mlp + mlp_out
+
+                res_mlp_hat = z + x_hat
+                mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
+                res_final_hat = res_mlp_hat + mlp_out_hat
+
+                # (4)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat, return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # (5)
+                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat, return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+            case "embed":
+                """(7) Train it to sparsely reconstruct activations of (4), (5) and (6)."""
+                
+                attn_out = model._module.torso[0].attn(x)
+                res_mlp = x + attn_out
+                mlp_out = model._module.torso[0].mlp(res_mlp)
+                res_final = res_mlp + mlp_out
+                
+                attn_out_hat = model._module.torso[0].attn(x_hat)
+                res_mlp_hat = x_hat + attn_out_hat
+                mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
+                res_final_hat = res_mlp_hat + mlp_out_hat
+
+                # (4)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat, return_topk=True)
+                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # (5)
+                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat, return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # (6)
+                f, _, _ = self.saes["torso[0].attn"].encode(attn_out, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].attn"].encode(attn_out_hat, return_topk=True)
+                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+
+            case _:
                     
-                    # Next layer reconstruction
-                    next_layer_activations = model._module.blocks[self.layer_idx + 1](x.reshape(64, 128, 768))
-                    next_layer_activations_hat = model._module.blocks[self.layer_idx + 1](x_hat.reshape(64, 128, 768))
-                    next_layer_activations_diff = next_layer_activations - next_layer_activations_hat
-                    next_layer_reconstruction = next_layer_activations_diff.pow(2).sum(dim=-1).mean()
-                    next_layer_alpha = 0.001
-                    loss += next_layer_alpha * next_layer_reconstruction
+                rec_loss = e.pow(2).sum(dim=-1).mean()
 
-                    if not logging:
-                        return loss
-                    else:
-                        return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
-                            y,
-                            x_hat,
-                            f,
-                            {"l2_{L}": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item(), "l2_{L+1}": next_layer_reconstruction.item()},
-                        )
+
+        auxk_loss = auxk_loss.sum(dim=-1).mean()
+        loss = rec_loss + self.auxk_alpha * auxk_loss
             
-            # Final layer, local reconstruction and KL divergence
-            log_kl = False
-            use_kl = False
-            only_kl = False
-            if log_kl:
-
-                # Original probabilities
-                # original_logits = model._module.lm_head(model._module.transformer.ln_f(x))
-                original_logits = model._module.unembed(model._module.ln_final(x))
-                original_probs = F.log_softmax(original_logits, dim=-1)
-
-                # Reconstructed probabilities
-                # reconstructed_logits = model._module.lm_head(model._module.transformer.ln_f(x_hat))
-                reconstructed_logits = model._module.unembed(model._module.ln_final(x_hat))
-                reconstructed_probs = F.log_softmax(reconstructed_logits, dim=-1)
-
-                # Compute KL divergence
-                kl_div = F.kl_div(reconstructed_probs, original_probs, log_target=True, reduction='batchmean')
-
-                # Update loss
-                if use_kl:
-                    kl_alpha = 100
-                    loss += kl_alpha * kl_div
-
-                if only_kl:
-                    loss = kl_div
-
-                if not logging:
-                    return loss
-                else:
-                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
-                        y,
-                        x_hat,
-                        f,
-                        {"l2_loss": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item(), "kl_div": kl_div.item()},
-                    )
-            
-            # Input and output is residual mid
-            if residual_kl:
-                layer = 11
-                
-                # Original probabilities
-                original_mlp_out = model._module.blocks[layer].apply_mlp(x)
-                original_block_output = x + original_mlp_out
-                original_logits = model._module.unembed(model._module.ln_final(original_block_output))
-                original_probs = F.log_softmax(original_logits, dim=-1)
-                
-                # Reconstructed probabilities
-                reconstructed_mlp_out = model._module.blocks[layer].apply_mlp(x)
-                reconstructed_block_output = x + reconstructed_mlp_out
-                reconstructed_logits = model._module.unembed(model._module.ln_final(reconstructed_block_output))
-                reconstructed_probs = F.log_softmax(reconstructed_logits, dim=-1)
-                
-                # Compute KL divergence
-                kl_div = F.kl_div(reconstructed_probs, original_probs, log_target=True, reduction='batchmean')
-                
-                # Compute MLP reconstruction
-                mlp_diff = reconstructed_mlp_out - original_mlp_out
-                mlp_reconstruction = mlp_diff.pow(2).sum(dim=-1).mean()
-                
-                # Update loss
-                kl_alpha = 100
-                mlp_alpha = 0.001
-                loss += kl_alpha * kl_div + mlp_alpha * mlp_reconstruction
-
-                if not logging:
-                    return loss
-                else:
-                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
-                        y,
-                        x_hat,
-                        f,
-                        {"l2_loss": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item(), "kl_div": kl_div.item(), "mlp_reconstruction": mlp_reconstruction.item()},
-                    )
-
-            # Input is mlp in, output is mlp out
-            if transcoder_kl:
-                layer = 11
-                
-                # Original probabilities
-                original_block_output = x + y
-                original_logits = model._module.unembed(model._module.ln_final(original_block_output))
-                original_probs = F.log_softmax(original_logits, dim=-1)
-                
-                # Reconstructed probabilities
-                reconstructed_block_output = x + x_hat
-                reconstructed_logits = model._module.unembed(model._module.ln_final(reconstructed_block_output))
-                reconstructed_probs = F.log_softmax(reconstructed_logits, dim=-1)
-                
-                # Compute KL divergence
-                kl_div = F.kl_div(reconstructed_probs, original_probs, log_target=True, reduction='batchmean')
-                
-                # Update loss
-                kl_alpha = 100
-                loss += kl_alpha * kl_div
-
-                if not logging:
-                    return loss
-                else:
-                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
-                        y,
-                        x_hat,
-                        f,
-                        {"l2_loss": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item(), "kl_div": kl_div.item()},
-                    )
-
         if not logging:
             return loss
         else:
@@ -405,7 +481,7 @@ class TrainerTopK(SAETrainer):
                 y,
                 x_hat,
                 f,
-                {"l2_loss": l2_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item()},
+                {"rec_loss": rec_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item()},
             )
 
     def update(self, step, x, model):        
@@ -413,7 +489,10 @@ class TrainerTopK(SAETrainer):
         # Initialise the decoder bias
         if step == 0:
             if isinstance(x, tuple):
-                act_in, act_out = x
+                if len(x) == 2: 
+                    act_in, act_out = x
+                else:
+                    act_in, act_out, act_add = x
                 median = geometric_median(act_in)
             else:
                 median = geometric_median(x)
@@ -424,10 +503,18 @@ class TrainerTopK(SAETrainer):
 
         # compute the loss
         if isinstance(x, tuple):
-            act_in, act_out = x
-            act_in = act_in.to(self.device)
-            act_out = act_out.to(self.device)
-            loss = self.loss(act_in, act_out, step=step, model=model)
+            
+            if len(x) == 2: 
+                act_in, act_out = x
+                act_in = act_in.to(self.device)
+                act_out = act_out.to(self.device)
+                loss = self.loss(act_in, act_out, step=step, model=model)
+            else:
+                act_in, act_out, act_add = x
+                act_in = act_in.to(self.device)
+                act_out = act_out.to(self.device)
+                act_add = act_add.to(self.device)
+                loss = self.loss(act_in, act_out, act_add, step=step, model=model)
         else:
             x = x.to(self.device)
             loss = self.loss(x, step=step, model=model)

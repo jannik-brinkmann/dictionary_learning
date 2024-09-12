@@ -4,7 +4,7 @@ Training dictionaries
 
 import torch as t
 from .dictionary import AutoEncoder
-from .buffer import SkipActivationBuffer
+from .buffer import SkipActivationBuffer, SkipActivationBufferWithAddition
 import os
 from tqdm import tqdm
 from .trainers.standard import StandardTrainer
@@ -26,19 +26,31 @@ def log_stats(
     with t.no_grad():
         # quick hack to make sure all trainers get the same x
         # TODO make this less hacky
-        act_in, act_out = act
-        z1 = act_in.clone()
-        z2 = act_out.clone()
+        if len(act) == 2: 
+            act_in, act_out = act
+            z1 = act_in.clone()
+            z2 = act_out.clone()
+        else: 
+            act_in, act_out, act_add = act
+            z1 = act_in.clone()
+            z2 = act_out.clone()
+            z3 = act_add.clone()
         for i, trainer in enumerate(trainers):
-            act_in = z1.clone()
-            act_out = z2.clone()
-            
+            if len(act) == 2:
+                act_in = z1.clone()
+                act_out = z2.clone()
+                act_add = None
+            else: 
+                act_in = z1.clone()
+                act_out = z2.clone()
+                act_add = z3.clone()
+
             if activations_split_by_head:  # x.shape: [batch, pos, n_heads, d_head]
                 raise Exception
                 act = act[..., i, :]
             trainer_name = f'{trainer.config["wandb_name"]}-{i}'
             if not transcoder:
-                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, step=step, model=model, logging=True)  # act is x
+                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, act_add, step=step, model=model, logging=True)  # act is x
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
@@ -48,7 +60,7 @@ def log_stats(
                 frac_variance_explained = 1 - residual_variance / total_variance
                 log[f"{trainer_name}/frac_variance_explained"] = frac_variance_explained.item()
             else:  # transcoder
-                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, step=step, logging=True)  # act is x, y
+                act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, act_add, step=step, logging=True)  # act is x, y
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
@@ -91,13 +103,17 @@ def trainSAE(
     Train SAEs using the given trainers
     """
 
+    if trainer_configs[0]["position_config"]:
+        position_config_path = trainer_configs[0]["position_config"].replace("[", ".").replace("]", "")
+        save_dir = os.path.join("outputs", position_config_path)
+
     trainers = []
     for config in trainer_configs:
         trainer = config['trainer']
         del config['trainer']
         trainers.append(
             trainer(
-                **config
+                **config,
             )
         )
 
@@ -134,7 +150,7 @@ def trainSAE(
         if steps is not None and step >= steps:
             break
         
-        if not isinstance(data, SkipActivationBuffer):
+        if not isinstance(data, SkipActivationBuffer) and not isinstance(data, SkipActivationBufferWithAddition):
             act = (act, act)
         
         # logging

@@ -16,7 +16,7 @@ def loss_recovered(
     max_len=None,  # max context length for loss recovered
     normalize_batch=False,  # normalize batch before passing through dictionary
     io="out",  # can be 'in', 'out', or 'in_and_out'
-    tracer_args = {'use_cache': False, 'output_attentions': False}, # minimize cache during model trace.
+    tracer_args = {}, # minimize cache during model trace.
 ):
     """
     How much of the model's loss is recovered by replacing the component output
@@ -34,7 +34,6 @@ def loss_recovered(
     logits_original = logits_original.value
     
     # logits when replacing component activations with reconstruction by autoencoder
-    print(text)
     with model.trace(text, **tracer_args, invoker_args=invoker_args):
         if io == 'in':
             x = submodule.input[0]
@@ -139,7 +138,7 @@ def loss_recovered(
         loss_kwargs = {}
     for logits in [logits_original, logits_reconstructed, logits_zero]:
         loss = t.nn.CrossEntropyLoss(**loss_kwargs)(
-            logits[:, :-1, :].reshape(-1, logits.shape[-1]), tokens[:, 1:].reshape(-1)
+            logits[:, :-1, :].reshape(-1, logits.shape[-1]), tokens[:, 1:].reshape(-1).to("cuda")
         )
         losses.append(loss)
 
