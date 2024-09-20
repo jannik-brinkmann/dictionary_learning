@@ -275,7 +275,7 @@ class SkipActivationBuffer(ActivationBuffer):
                 hidden_states_out = hidden_states_out[attn_mask != 0]
             else:
                 a, b, c = hidden_states_out.shape
-                hidden_states_out = hidden_states_in.view(a * b, c)
+                hidden_states_out = hidden_states_out.view(a * b, c)
 
             remaining_space = self.activation_buffer_size - current_idx
             assert remaining_space > 0

@@ -346,7 +346,15 @@ class TrainerTopK(SAETrainer):
                 """(2) Train it to sparsely reconstruct activations of (1)."""
                 f, _, _ = self.saes["torso[1].res_final"].encode(x + y, return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].res_final"].encode(x + x_hat, return_topk=True)
-                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                def _log_cosh(x: t.Tensor) -> t.Tensor:
+                    return x + t.nn.functional.softplus(-2. * x) - t.log(t.tensor(2.0))
+                
+                rec_loss = e.pow(2).sum(dim=-1).mean()  # just local reconstruction
+
+                # rec_loss = t.mean(_log_cosh(f - f_hat)) # log-cosh
+                # rec_loss = (f - f_hat).sum(dim=-1).mean() # L1
+                # rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean() # L2
 
             case "torso[1].attn":  # z is the residual stream before the attn
                 """(3) Train it to sparsely reconstruct activations of (1) and (2)."""
@@ -451,7 +459,7 @@ class TrainerTopK(SAETrainer):
             case "embed":
                 """(7) Train it to sparsely reconstruct activations of (4), (5) and (6)."""
 
-                # requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+                # Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
 
                 a = 64
                 b = 128

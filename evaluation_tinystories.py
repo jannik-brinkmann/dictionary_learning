@@ -11,7 +11,8 @@ from .config import DEBUG
 def loss_recovered(
     text,  # a batch of text
     model: LanguageModel,  # an nnsight LanguageModel
-    submodule,  # submodules of model
+    submodule_in,
+    submodule_out,  # submodules of model
     dictionary,  # dictionaries for submodules
     max_len=None,  # max context length for loss recovered
     normalize_batch=False,  # normalize batch before passing through dictionary
@@ -36,20 +37,20 @@ def loss_recovered(
     # logits when replacing component activations with reconstruction by autoencoder
     with model.trace(text, **tracer_args, invoker_args=invoker_args):
         if io == 'in':
-            x = submodule.input[0]
-            if type(submodule.input.shape) == tuple: x = x[0]
+            x = submodule_in.input[0]
+            if type(submodule_in.input.shape) == tuple: x = x[0]
             if normalize_batch:
                 scale = (dictionary.activation_dim ** 0.5) / x.norm(dim=-1).mean()
                 x = x * scale
         elif io == 'out':
-            x = submodule.output
-            if type(submodule.output.shape) == tuple: x = x[0]
+            x = submodule_in.output
+            if type(submodule_in.output.shape) == tuple: x = x[0]
             if normalize_batch:
                 scale = (dictionary.activation_dim ** 0.5) / x.norm(dim=-1).mean()
                 x = x * scale
         elif io == 'in_and_out':
-            x = submodule.input[0]
-            if type(submodule.input.shape) == tuple: x = x[0]
+            x = submodule_in.input[0]
+            if type(submodule_in.input.shape) == tuple: x = x[0]
             print(f'x.shape: {x.shape}')
             if normalize_batch:
                 scale = (dictionary.activation_dim ** 0.5) / x.norm(dim=-1).mean()
@@ -64,29 +65,29 @@ def loss_recovered(
     # intervene with `x_hat`
     with model.trace(text, **tracer_args, invoker_args=invoker_args):
         if io == 'in':
-            x = submodule.input[0]
+            x = submodule_in.input[0]
             if normalize_batch:
                 scale = (dictionary.activation_dim ** 0.5) / x.norm(dim=-1).mean()
                 x_hat = x_hat / scale
-            if type(submodule.input.shape) == tuple:
-                submodule.input[0][:] = x_hat
+            if type(submodule_out.input.shape) == tuple:
+                submodule_out.input[0][:] = x_hat
             else:
-                submodule.input = x_hat
+                submodule_out.input = x_hat
         elif io == 'out':
-            x = submodule.output
+            x = submodule_in.output
             if normalize_batch:
                 scale = (dictionary.activation_dim ** 0.5) / x.norm(dim=-1).mean()
                 x_hat = x_hat / scale
-            if type(submodule.output.shape) == tuple:
-                submodule.output = (x_hat,)
+            if type(submodule_out.output.shape) == tuple:
+                submodule_out.output = (x_hat,)
             else:
-                submodule.output = x_hat
+                submodule_out.output = x_hat
         elif io == 'in_and_out':
-            x = submodule.input[0]
+            x = submodule_in.input[0]
             if normalize_batch:
                 scale = (dictionary.activation_dim ** 0.5) / x.norm(dim=-1).mean()
                 x_hat = x_hat / scale
-            submodule.output = x_hat
+            submodule_out.output = x_hat
         else:
             raise ValueError(f"Invalid value for io: {io}")
 
@@ -96,17 +97,17 @@ def loss_recovered(
     # logits when replacing component activations with zeros
     with model.trace(text, **tracer_args, invoker_args=invoker_args):
         if io == 'in':
-            x = submodule.input[0]
-            if type(submodule.input.shape) == tuple:
-                submodule.input[0][:] = t.zeros_like(x[0])
+            x = submodule_out.input[0]
+            if type(submodule_out.input.shape) == tuple:
+                submodule_out.input[0][:] = t.zeros_like(x[0])
             else:
-                submodule.input = t.zeros_like(x)
+                submodule_out.input = t.zeros_like(x)
         elif io in ['out', 'in_and_out']:
-            x = submodule.output
-            if type(submodule.output.shape) == tuple:
-                submodule.output[0][:] = t.zeros_like(x[0])
+            x = submodule_out.output
+            if type(submodule_out.output.shape) == tuple:
+                submodule_out.output[0][:] = t.zeros_like(x[0])
             else:
-                submodule.output = t.zeros_like(x)
+                submodule_out.output = t.zeros_like(x)
         else:
             raise ValueError(f"Invalid value for io: {io}")
         
