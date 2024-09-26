@@ -209,11 +209,35 @@ class TrainerTopK(SAETrainer):
 
             case "torso[0].res_mlp": 
 
+                ae_path = get_sae_path("torso[1].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_final"] = ae
+
+                ae_path = get_sae_path("torso[1].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_mlp"] = ae
+
+                ae_path = get_sae_path("torso[1].attn")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].attn"] = ae
+
                 ae_path = get_sae_path("torso[0].res_final")
                 ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
                 self.saes["torso[0].res_final"] = ae
 
             case "torso[0].attn": 
+
+                ae_path = get_sae_path("torso[1].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_final"] = ae
+
+                ae_path = get_sae_path("torso[1].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_mlp"] = ae
+
+                ae_path = get_sae_path("torso[1].attn")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].attn"] = ae
 
                 ae_path = get_sae_path("torso[0].res_final")
                 ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
@@ -224,6 +248,18 @@ class TrainerTopK(SAETrainer):
                 self.saes["torso[0].res_mlp"] = ae
 
             case "embed":
+
+                ae_path = get_sae_path("torso[1].res_final")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_final"] = ae
+
+                ae_path = get_sae_path("torso[1].res_mlp")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].res_mlp"] = ae
+
+                ae_path = get_sae_path("torso[1].attn")
+                ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
+                self.saes["torso[1].attn"] = ae
 
                 ae_path = get_sae_path("torso[0].res_final")
                 ae = AutoEncoderTopK.from_pretrained(ae_path, k=30, device="cuda")  
@@ -335,100 +371,238 @@ class TrainerTopK(SAETrainer):
         else:
             auxk_loss = x_hat.new_tensor(0.0)
 
+        # Base loss definition
+        rec_loss = 0
+        auxk_loss = auxk_loss.sum(dim=-1).mean()
+        loss = self.auxk_alpha * auxk_loss
+
         # Compute loss based on specific layer
+        
         match self.position_config:
             
             case "torso[1].res_final": 
                 """(1) For the final SAE, just compute local reconstruction."""
-                rec_loss = e.pow(2).sum(dim=-1).mean()
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
+                loss += local_reconstruction
+
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case "torso[1].res_mlp":  # z is residual before mlp
                 """(2) Train it to sparsely reconstruct activations of (1)."""
+
+                # Local
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
+
+                # Res final features
                 f, _, _ = self.saes["torso[1].res_final"].encode(x + y, return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].res_final"].encode(x + x_hat, return_topk=True)
+                res_final_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean() # L2
 
-                def _log_cosh(x: t.Tensor) -> t.Tensor:
-                    return x + t.nn.functional.softplus(-2. * x) - t.log(t.tensor(2.0))
-                
-                rec_loss = e.pow(2).sum(dim=-1).mean()  # just local reconstruction
+                # Train only to reconstruct res final features
+                loss += res_final_feature_loss
 
-                # rec_loss = t.mean(_log_cosh(f - f_hat)) # log-cosh
-                # rec_loss = (f - f_hat).sum(dim=-1).mean() # L1
-                # rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean() # L2
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "res_final_feature_loss": res_final_feature_loss.item(),
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case "torso[1].attn":  # z is the residual stream before the attn
                 """(3) Train it to sparsely reconstruct activations of (1) and (2)."""
 
-                # Here we don't need to reshape as MLPs perform local operations
-
+                # Run the rest of the model
                 resid_mid = z + x
                 resid_post = resid_mid + model._module.torso[1].mlp(resid_mid)
 
+                # Run the rest of the model with reconstructed activations
                 resid_mid_hat = z + x_hat
                 resid_post_hat = resid_mid_hat + model._module.torso[1].mlp(resid_mid_hat)
 
-                # (1)
+                # Local
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
+
+                # Res final features
                 f, _, _ = self.saes["torso[1].res_final"].encode(resid_post, return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].res_final"].encode(resid_post_hat, return_topk=True)
-                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                res_final_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
 
-                # (2)
+                # MLP transcoder features
                 f, _, _ = self.saes["torso[1].res_mlp"].encode(resid_mid, return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(resid_mid_hat, return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                mlp_transcoder_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Train only to predict res final and mlp transcoder features
+                loss += res_final_feature_loss + mlp_transcoder_feature_loss
+
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "res_final_feature_loss": res_final_feature_loss.item(),
+                            "mlp_transcoder_feature_loss": mlp_transcoder_feature_loss.item(),
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case "torso[0].res_final": 
                 """(4) Train it to sparsely reconstruct activations of (1), (2), and (3)."""
 
-                # Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+                # Note: Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
 
                 a = 64
                 b = 128
                 _, d = x.shape
 
+                # Run the rest of the model
                 x_reshaped = x.view(a, b, d)
                 attn_out = model._module.torso[1].attn(x_reshaped)
                 res_mlp = x_reshaped + attn_out
                 mlp_out = model._module.torso[1].mlp(res_mlp)
                 res_final = res_mlp + mlp_out
 
+                # Run the rest of the model with reconstructed activations
                 x_hat_reshaped = x_hat.view(a, b, d)
                 attn_out_hat = model._module.torso[1].attn(x_hat_reshaped)
                 res_mlp_hat = x_hat_reshaped + attn_out_hat
                 mlp_out_hat = model._module.torso[1].mlp(res_mlp_hat)
                 res_final_hat = res_mlp_hat + mlp_out_hat
 
-                # (1)
+                # Local
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
+
+                # Res final features
                 f, _, _ = self.saes["torso[1].res_final"].encode(res_final.view(a * b, d), return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
-                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                res_final_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
 
-                # (2)
+                # MLP transcoder features
                 f, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                mlp_transcoder_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
 
-                # (3)
+                # Attn out features
                 f, _, _ = self.saes["torso[1].attn"].encode(attn_out.view(a * b, d), return_topk=True)
                 f_hat, _, _ = self.saes["torso[1].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                attn_out_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                loss += res_final_feature_loss + mlp_transcoder_feature_loss + attn_out_feature_loss
+
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "res_final_feature_loss": res_final_feature_loss.item(),
+                            "mlp_transcoder_features": mlp_transcoder_feature_loss.item(),
+                            "attn_out_feature_loss": attn_out_feature_loss.item(),
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case "torso[0].res_mlp": 
                 """(5) Train it to sparsely reconstruct activations of (4)."""
 
-                res_final = x + y
+                # Note: Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
 
-                res_final_hat = x + x_hat
+                a = 64
+                b = 128
+                _, d = x.shape
 
-                # (4)
-                f, _, _ = self.saes["torso[0].res_final"].encode(res_final, return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat, return_topk=True)
-                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                # Run the rest of the model
+                res_final_0 = x + y
+                x_reshaped = res_final_0.view(a, b, d)
+                attn_out = model._module.torso[1].attn(x_reshaped)
+                res_mlp = x_reshaped + attn_out
+                mlp_out = model._module.torso[1].mlp(res_mlp)
+                res_final = res_mlp + mlp_out
+
+                # Run the rest of the model with reconstructed activations
+                res_final_0_hat = x + x_hat
+                x_hat_reshaped = res_final_0_hat.view(a, b, d)
+                attn_out_hat = model._module.torso[1].attn(x_hat_reshaped)
+                res_mlp_hat = x_hat_reshaped + attn_out_hat
+                mlp_out_hat = model._module.torso[1].mlp(res_mlp_hat)
+                res_final_hat = res_mlp_hat + mlp_out_hat
+
+                # Local
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
+
+                # Res final features
+                f, _, _ = self.saes["torso[1].res_final"].encode(res_final.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
+                res_final_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # MLP transcoder features
+                f, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
+                mlp_transcoder_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Attn out features
+                f, _, _ = self.saes["torso[1].attn"].encode(attn_out.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
+                attn_out_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Res final features (Layer 0)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final_0, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_0_hat, return_topk=True)
+                res_final_0_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                loss += res_final_0_feature_loss
+
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "res_final_feature_loss": res_final_feature_loss.item(),
+                            "mlp_transcoder_features": mlp_transcoder_feature_loss.item(),
+                            "attn_out_feature_loss": attn_out_feature_loss.item(),
+                            "res_final_0_feature_loss": res_final_0_feature_loss.item(),
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case "torso[0].attn": # z is residual before attn
                 """(6) Train it to sparsely reconstruct activations of (4) and (5)."""
 
-                # Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+                # Note: Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
 
                 a = 64
                 b = 128
@@ -436,79 +610,168 @@ class TrainerTopK(SAETrainer):
 
                 z_reshaped = z.view(a, b, d)
 
+                # Run the rest of the model
                 x_reshaped = x.view(a, b, d)
-                res_mlp = z_reshaped + x_reshaped
-                mlp_out = model._module.torso[0].mlp(res_mlp)
+                res_mlp_0 = z_reshaped + x_reshaped
+                mlp_0_out = model._module.torso[0].mlp(res_mlp_0)
+                res_final_0 = res_mlp_0 + mlp_0_out
+                x_reshaped = res_final_0.view(a, b, d)
+                attn_out = model._module.torso[1].attn(x_reshaped)
+                res_mlp = x_reshaped + attn_out
+                mlp_out = model._module.torso[1].mlp(res_mlp)
                 res_final = res_mlp + mlp_out
 
+                # Run the rest of the model with reconstructed activations
                 x_hat_reshaped = x_hat.view(a, b, d)
-                res_mlp_hat = z_reshaped + x_hat_reshaped
-                mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
+                res_mlp_0_hat = z_reshaped + x_hat_reshaped
+                mlp_out_0_hat = model._module.torso[0].mlp(res_mlp_0_hat)
+                res_final_0_hat = res_mlp_0_hat + mlp_out_0_hat
+                x_hat_reshaped = res_final_0_hat.view(a, b, d)
+                attn_out_hat = model._module.torso[1].attn(x_hat_reshaped)
+                res_mlp_hat = x_hat_reshaped + attn_out_hat
+                mlp_out_hat = model._module.torso[1].mlp(res_mlp_hat)
                 res_final_hat = res_mlp_hat + mlp_out_hat
 
-                # (4)
-                f, _, _ = self.saes["torso[0].res_final"].encode(res_final.view(a * b, d), return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
-                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                # Local
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
 
-                # (5)
-                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                # Res final features
+                f, _, _ = self.saes["torso[1].res_final"].encode(res_final.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
+                res_final_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # MLP transcoder features
+                f, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
+                mlp_transcoder_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Attn out features
+                f, _, _ = self.saes["torso[1].attn"].encode(attn_out.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
+                attn_out_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Res final features (Layer 0)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final_0, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_0_hat, return_topk=True)
+                res_final_0_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                
+                # MLP transcoder features (Layer 0)
+                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_0.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_0_hat.view(a * b, d), return_topk=True)
+                mlp_transcoder_0_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                loss += res_final_0_feature_loss + mlp_transcoder_0_feature_loss
+
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "res_final_feature_loss": res_final_feature_loss.item(),
+                            "mlp_transcoder_features": mlp_transcoder_feature_loss.item(),
+                            "attn_out_feature_loss": attn_out_feature_loss.item(),
+                            "res_final_0_feature_loss": res_final_0_feature_loss.item(),
+                            "mlp_transcoder_0_feature_loss": mlp_transcoder_0_feature_loss.item(),
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case "embed":
                 """(7) Train it to sparsely reconstruct activations of (4), (5) and (6)."""
 
-                # Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
+                # Note: Attention requires that the (a * b, d) shaped activations are reshaped to (a, b, d)
 
                 a = 64
                 b = 128
                 _, d = x.shape
 
+                # Run the rest of the model
                 x_reshaped = x.view(a, b, d)
-                attn_out = model._module.torso[0].attn(x_reshaped)
+                attn_out_0 = model._module.torso[0].attn(x_reshaped)
+                res_mlp_0 = x_reshaped + attn_out_0
+                mlp_out_0 = model._module.torso[0].mlp(res_mlp_0)
+                res_final_0 = res_mlp_0 + mlp_out_0
+                x_reshaped = res_final_0.view(a, b, d)
+                attn_out = model._module.torso[1].attn(x_reshaped)
                 res_mlp = x_reshaped + attn_out
-                mlp_out = model._module.torso[0].mlp(res_mlp)
+                mlp_out = model._module.torso[1].mlp(res_mlp)
                 res_final = res_mlp + mlp_out
-                
+
+                # Run the rest of the model with reconstructed activations
                 x_hat_reshaped = x_hat.view(a, b, d)
-                attn_out_hat = model._module.torso[0].attn(x_hat_reshaped)
+                attn_out_0_hat = model._module.torso[0].attn(x_hat_reshaped)
+                res_mlp_0_hat = x_hat_reshaped + attn_out_0_hat
+                mlp_out_0_hat = model._module.torso[0].mlp(res_mlp_0_hat)
+                res_final_0_hat = res_mlp_0_hat + mlp_out_0_hat
+                x_hat_reshaped = res_final_0_hat.view(a, b, d)
+                attn_out_hat = model._module.torso[1].attn(x_hat_reshaped)
                 res_mlp_hat = x_hat_reshaped + attn_out_hat
-                mlp_out_hat = model._module.torso[0].mlp(res_mlp_hat)
+                mlp_out_hat = model._module.torso[1].mlp(res_mlp_hat)
                 res_final_hat = res_mlp_hat + mlp_out_hat
 
-                # (4)
-                f, _, _ = self.saes["torso[0].res_final"].encode(res_final.view(a * b, d), return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
-                rec_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                # Local
+                local_reconstruction = e.pow(2).sum(dim=-1).mean()
 
-                # (5)
-                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                # Res final features
+                f, _, _ = self.saes["torso[1].res_final"].encode(res_final.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_final"].encode(res_final_hat.view(a * b, d), return_topk=True)
+                res_final_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # MLP transcoder features
+                f, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].res_mlp"].encode(res_mlp_hat.view(a * b, d), return_topk=True)
+                mlp_transcoder_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Attn out features
+                f, _, _ = self.saes["torso[1].attn"].encode(attn_out.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[1].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
+                attn_out_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                # Res final features (Layer 0)
+                f, _, _ = self.saes["torso[0].res_final"].encode(res_final_0, return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_final"].encode(res_final_0_hat, return_topk=True)
+                res_final_0_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+                
+                # MLP transcoder features (Layer 0)
+                f, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_0.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].res_mlp"].encode(res_mlp_0_hat.view(a * b, d), return_topk=True)
+                mlp_transcoder_0_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()               
 
                 # (6)
-                f, _, _ = self.saes["torso[0].attn"].encode(attn_out.view(a * b, d), return_topk=True)
-                f_hat, _, _ = self.saes["torso[0].attn"].encode(attn_out_hat.view(a * b, d), return_topk=True)
-                rec_loss += (f - f_hat).pow(2).sum(dim=-1).mean()
+                f, _, _ = self.saes["torso[0].attn"].encode(attn_out_0.view(a * b, d), return_topk=True)
+                f_hat, _, _ = self.saes["torso[0].attn"].encode(attn_out_0_hat.view(a * b, d), return_topk=True)
+                attn_out_0_feature_loss = (f - f_hat).pow(2).sum(dim=-1).mean()
+
+                loss += res_final_0_feature_loss + mlp_transcoder_0_feature_loss + attn_out_0_feature_loss
+
+                if not logging:
+                    return loss
+                else:
+                    return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
+                        y,
+                        x_hat,
+                        f,
+                        {
+                            "local_reconstruction": local_reconstruction.item(), 
+                            "res_final_feature_loss": res_final_feature_loss.item(),
+                            "mlp_transcoder_features": mlp_transcoder_feature_loss.item(),
+                            "attn_out_feature_loss": attn_out_feature_loss.item(),
+                            "res_final_0_feature_loss": res_final_0_feature_loss.item(),
+                            "mlp_transcoder_0_feature_loss": mlp_transcoder_0_feature_loss.item(),
+                            "attn_out_0_feature_loss": attn_out_0_feature_loss.item(),
+                            "auxk_loss": auxk_loss.item(), 
+                            "loss": loss.item()
+                        },
+                    )
 
             case _:
                     
                 rec_loss = e.pow(2).sum(dim=-1).mean()
-
-
-        auxk_loss = auxk_loss.sum(dim=-1).mean()
-        loss = rec_loss + self.auxk_alpha * auxk_loss
-            
-        if not logging:
-            return loss
-        else:
-            return namedtuple("LossLog", ["x", "x_hat", "f", "losses"])(
-                y,
-                x_hat,
-                f,
-                {"rec_loss": rec_loss.item(), "auxk_loss": auxk_loss.item(), "loss": loss.item()},
-            )
 
     def update(self, step, x, model):        
         

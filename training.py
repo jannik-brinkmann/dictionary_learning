@@ -2,6 +2,7 @@
 Training dictionaries
 """
 
+import copy
 import torch as t
 from .dictionary import AutoEncoder
 from .buffer import SkipActivationBuffer, SkipActivationBufferWithAddition
@@ -11,9 +12,40 @@ from .trainers.standard import StandardTrainer
 import wandb
 import json
 # from .evaluation import evaluate
+from .evaluation_tinystories import loss_recovered
+
+
+def get_loss_recovered(model, data, ae, submodule_in, submodule_out):
+    num_batches = 256
+    total_base_loss = 0
+    total_recovered_loss = 0
+    total_zero_loss = 0
+
+    for _ in range(num_batches):
+        base_loss, recovered_loss, zero_loss = loss_recovered(
+            data.text_batch(batch_size=16),
+            model=model,
+            submodule_in=submodule_in,
+            submodule_out=submodule_out,
+            dictionary=ae,
+            max_len=128,
+            normalize_batch=False,
+            io="out",
+            tracer_args = {},
+        )
+        total_base_loss += base_loss.cpu().item()
+        total_recovered_loss += recovered_loss.cpu().item()
+        total_zero_loss += zero_loss.cpu().item()
+
+    avg_base_loss = total_base_loss / num_batches
+    avg_recovered_loss = total_recovered_loss / num_batches
+    avg_zero_loss = total_zero_loss / num_batches
+    return (avg_recovered_loss - avg_zero_loss) / (avg_base_loss - avg_zero_loss), avg_base_loss, avg_recovered_loss, avg_zero_loss
+
 
 def log_stats(
     model,
+    data,
     trainers,
     step: int,
     act: t.Tensor,
@@ -54,11 +86,22 @@ def log_stats(
 
                 # L0
                 l0 = (f != 0).float().sum(dim=-1).mean().item()
+
                 # fraction of variance explained
                 total_variance = t.var(act_out, dim=0).sum()
                 residual_variance = t.var(act_out - act_hat, dim=0).sum()
                 frac_variance_explained = 1 - residual_variance / total_variance
                 log[f"{trainer_name}/frac_variance_explained"] = frac_variance_explained.item()
+
+                # loss recovered
+                frac_loss_rec, base_loss, recovered_loss, zero_loss = get_loss_recovered(
+                    model, data, trainer.ae, data.submodule_in, data.submodule_out
+                )
+                log[f"{trainer_name}/frac_loss_rec"] = frac_loss_rec
+                log[f"{trainer_name}/base_loss"] = base_loss
+                log[f"{trainer_name}/recovered_loss"] = recovered_loss
+                log[f"{trainer_name}/zero_loss"] = zero_loss
+                
             else:  # transcoder
                 act_out, act_hat, f, losslog = trainer.loss(act_in, act_out, act_add, step=step, logging=True)  # act is x, y
 
@@ -86,6 +129,7 @@ def log_stats(
 def trainSAE(
         model,
         data, 
+        eval_data,
         trainer_configs,
         use_wandb = False,
         wandb_entity = "",
@@ -155,7 +199,7 @@ def trainSAE(
         
         # logging
         if log_steps is not None and step % log_steps == 0:
-            log_stats(model, trainers, step, act, use_wandb, activations_split_by_head, transcoder)
+            log_stats(model, eval_data, trainers, step, act, use_wandb, activations_split_by_head, transcoder)
             
         # saving
         if save_steps is not None and step % save_steps == 0:
