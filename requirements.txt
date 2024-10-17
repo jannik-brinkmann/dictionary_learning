@@ -10,3 +10,6 @@ tqdm>=4.66.1
 umap-learn>=0.5.6
 zstandard>=0.22.0
 wandb
+tinymodel
+transformers==4.44.2
+tokenizers==0.19.1
